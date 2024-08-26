@@ -6,14 +6,16 @@ import random
 import shutil
 from contextlib import nullcontext
 from pathlib import Path
-
+from PIL import Image, ImageOps
 import accelerate
 import datasets
+from datasets import load_dataset
 import numpy as np
 import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint
 import transformers
+from torchvision import transforms
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.state import AcceleratorState
@@ -37,7 +39,12 @@ from einops import rearrange
 from src.flux.sampling import denoise, get_noise, get_schedule, prepare, unpack
 from src.flux.util import (configs, load_ae, load_clip,
                        load_flow_model2, load_controlnet, load_t5)
-from image_datasets.canny_dataset import loader
+from controlnet_aux import LineartDetector
+from image_datasets.sketch_dataset import loader
+
+MAX_CONSISTENCY = 0.14
+
+
 if is_wandb_available():
     import wandb
 logger = get_logger(__name__, log_level="INFO")
@@ -62,10 +69,188 @@ def parse_args():
 
 
     return args.config
-def main():
 
+
+def get_train_dataset(train_data_dir, accelerator):
+
+    data_files = {}
+    data_files["train"] = os.path.join(train_data_dir, "**")
+    dataset = load_dataset(
+        "imagefolder",
+        data_files=data_files,
+        # cache_dir=args.cache_dir,
+    )
+
+    # Preprocessing the datasets.
+    # We need to tokenize inputs and targets.
+    # column_names = dataset["train"].column_names
+
+    # # 6. Get the column names for input/target.
+    # if args.image_column is None:
+    #     image_column = column_names[0]
+    #     logger.info(f"image column defaulting to {image_column}")
+    # else:
+    #     image_column = args.image_column
+    #     if image_column not in column_names:
+    #         raise ValueError(
+    #             f"`--image_column` value '{args.image_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
+    #         )
+
+    # if args.caption_column is None:
+    #     caption_column = column_names[1]
+    #     logger.info(f"caption column defaulting to {caption_column}")
+    # else:
+    #     caption_column = args.caption_column
+    #     if caption_column not in column_names:
+    #         raise ValueError(
+    #             f"`--caption_column` value '{args.caption_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
+    #         )
+
+    # with accelerator.main_process_first():
+    #     train_dataset = dataset["train"].shuffle(seed=args.seed)
+    #     if args.max_train_samples is not None:
+    #         train_dataset = train_dataset.select(range(args.max_train_samples))
+    return dataset["train"]
+
+def prepare_train_dataset(dataset, accelerator, args):
+    image_transforms = transforms.Compose(
+        [
+            transforms.Resize(
+                args.img_size, interpolation=transforms.InterpolationMode.BILINEAR
+            ),
+            transforms.CenterCrop(args.img_size),
+            transforms.ToTensor(),
+            transforms.Normalize([0.5], [0.5]),
+        ]
+    )
+
+    conditioning_image_transforms = transforms.Compose(
+        [
+            transforms.Resize(
+                args.img_size, interpolation=transforms.InterpolationMode.BILINEAR
+            ),
+            transforms.CenterCrop(args.img_size),
+        ]
+    )
+
+    def preprocess_train(examples):
+        images = [image.convert("RGB") for image in examples[args.image_column]]
+        images = [image_transforms(image) for image in images]
+
+        # just passing the ground truth as conditioning image. It will be converted online during training
+        # so that each GPU can have it's own loader
+        conditioning_images = [
+            image.convert("RGB") for image in examples[args.image_column]
+        ]
+        conditioning_images = [
+            conditioning_image_transforms(image) for image in conditioning_images
+        ]
+
+        examples["pixel_values"] = images
+        examples["conditioning_images"] = conditioning_images
+
+        return examples
+
+    with accelerator.main_process_first():
+        dataset = dataset.with_transform(preprocess_train)
+
+    return dataset
+
+
+def collate_fn(examples):
+    pixel_values = torch.stack([example["pixel_values"] for example in examples])
+    pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
+
+    conditioning_pixel_values = [example["conditioning_images"] for example in examples]
+
+    prompts = [example["text"] for example in examples]
+
+    return {
+        "pixel_values": pixel_values,
+        "conditioning_images": conditioning_pixel_values,
+        "prompts": prompts
+    }
+
+
+def detect_sketch(img, detector):
+    # bunch of augmentation to make the model more tolerant to different styles of sketches
+    COARSE_PROB = 0.2
+    detect_res = [380, 512, 768, 1024]
+    brightness_range = [0.6, 1.0]
+    detect_cycles = [1, 2]
+
+    c_coarse = random.uniform(0, 1) < COARSE_PROB
+    c_res = random.choice(detect_res)
+    c_brightness = random.uniform(brightness_range[0], brightness_range[1])
+    # Don't run the lineart detector multiple time with a coarse detection as the results will be terrible
+    c_cycles = 1 if c_coarse else random.choice(detect_cycles)
+
+    feed = img
+    for _ in range(c_cycles):
+        out = detector(
+            feed, coarse=c_coarse, detect_resolution=c_res, image_resolution=512
+        )
+        feed = ImageOps.invert(out)
+    out = out.resize(img.size)
+
+    out = np.array(out.convert("L"))
+    out = out * c_brightness
+    out = Image.fromarray(out).convert("RGB")
+    
+    ref = ImageOps.invert(img.convert('L'))
+
+    gen = np.array(out.convert('L'))/255.
+    ref = np.array(ref)/255.
+    overlap = ref*gen
+    consistency_score = overlap.sum() / ref.sum()
+    if consistency_score > MAX_CONSISTENCY:
+        # High consistency between reference image and generated sketch indicate that the reference image was a lineart or a sketch to begin with
+        # training on this kind of data will lead to bad quality generations when passing actual sketches to the model
+        # When that happens (about 5-7% of the time with MAX_CONSISTENCY=0.15 on MJ data) we instead return a full black image
+        out = Image.new('RGB', img.size, (0, 0, 0))
+
+    return out
+
+
+
+def get_conditioning_image(img, detector):
+    toTensor = transforms.ToTensor()
+    ground_truth = img.convert("RGB")
+    sketch_img = detect_sketch(ground_truth, detector)
+    return toTensor(sketch_img)
+
+
+def process_batch(batch, accelerator, lineart_detector):
+    conditioning_images = [
+        get_conditioning_image(img, lineart_detector)
+        for img in batch["conditioning_images"]
+    ]
+    conditioning_pixel_values = torch.stack(conditioning_images)
+    conditioning_pixel_values = (
+        conditioning_pixel_values.to(memory_format=torch.contiguous_format)
+        .float()
+        .to(accelerator.device)
+    )
+    batch["conditioning_pixel_values"] = conditioning_pixel_values
+
+    # batch = compute_embeddings(
+    #     batch,
+    #     accelerator,
+    #     args.proportion_empty_prompts,
+    #     text_encoders,
+    #     tokenizers,
+    #     is_train=True,
+    # )
+
+
+    return batch
+
+
+def main():
     args = OmegaConf.load(parse_args())
     is_schnell = args.model_name == "flux-schnell"
+    if is_schnell:
+        print('Training on top of Schnell, is this supported?')
     logging_dir = os.path.join(args.output_dir, args.logging_dir)
 
     accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
@@ -122,7 +307,30 @@ def main():
         eps=args.adam_epsilon,
     )
 
-    train_dataloader = loader(**args.data_config)
+    lineart_detector = LineartDetector.from_pretrained("lllyasviel/Annotators").to('cuda')
+
+    # data_files = {}
+    # data_files["train"] = os.path.join(args.data_config.img_dir, "**")
+    # dataset = load_dataset(
+    #     "imagefolder",
+    #     data_files=data_files,
+    #     # cache_dir=args.cache_dir,
+    # )
+    # train_dataloader = loader(**args.data_config)
+    
+
+    train_dataset = get_train_dataset(args.data_config.img_dir, accelerator)
+    train_dataset = prepare_train_dataset(train_dataset, accelerator, args.data_config)
+
+    train_dataloader = torch.utils.data.DataLoader(
+        train_dataset,
+        shuffle=True,
+        collate_fn=collate_fn,
+        batch_size=args.train_batch_size,
+        num_workers=args.data_config.num_workers,
+    )
+
+    
     # Scheduler and math around the number of training steps.
     overrode_max_train_steps = False
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -207,8 +415,21 @@ def main():
         train_loss = 0.0
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(controlnet):
-                img, control_image, prompts = batch
-                control_image = control_image.to(accelerator.device)
+                # img, control_image, prompts = batch
+                batch = process_batch(batch, accelerator, lineart_detector)
+                
+                prompts = batch['prompts']
+                img = batch['pixel_values']
+                control_image = batch['conditioning_pixel_values']
+
+                # img, prompts = batch
+                # control_image = lineart_detector(img)
+                # img = torch.from_numpy((np.array(img) / 127.5) - 1)
+                # img = img.permute(2, 0, 1)
+                # control_image = torch.from_numpy((np.array(control_image) / 127.5) - 1)
+                # control_image = control_image.permute(2, 0, 1)
+
+                # control_image = control_image.to(accelerator.device)
                 with torch.no_grad():
                     x_1 = vae.encode(img.to(accelerator.device).to(torch.float32))
                     inp = prepare(t5=t5, clip=clip, img=x_1, prompt=prompts)
@@ -219,7 +440,6 @@ def main():
                 t = torch.sigmoid(torch.randn((bs,), device=accelerator.device))
 
                 x_0 = torch.randn_like(x_1).to(accelerator.device)
-                print(t.shape, x_1.shape, x_0.shape)
                 x_t = (1 - t.unsqueeze(1).unsqueeze(2).repeat(1, x_1.shape[1], x_1.shape[2])) * x_1 + t.unsqueeze(1).unsqueeze(2).repeat(1, x_1.shape[1], x_1.shape[2]) * x_0
                 bsz = x_1.shape[0]
                 guidance_vec = torch.full((x_t.shape[0],), 4, device=x_t.device, dtype=x_t.dtype)
